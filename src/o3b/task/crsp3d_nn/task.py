@@ -4,6 +4,7 @@ import logging
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,10 @@ def _render_part_imgs(
 
         sf = src_feats[b, :V_src_real].float()
         tf = trgt_feats[b, :V_trgt_real].float()
+        # Always mean/euclidean regardless of Crsp3DNNTask's match_mode/dist_type
+        # (Stage 2): this is the reverse direction (target vert -> nearest source
+        # vert) and would need src_feats_all_views to stay consistent, which is out
+        # of scope — see the scope-boundary note in Crsp3DNNTask.forward().
         feat_dists = torch.cdist(tf, sf)  # (V_trgt, V_src)
         if src_verts_mask is not None:
             feat_dists = feat_dists.masked_fill(~src_verts_mask[b, :V_src_real].unsqueeze(0), float("inf"))
@@ -381,6 +386,17 @@ def _render_corr_imgs(
 
 # ── task ──────────────────────────────────────────────────────────────────────
 
+# Stage 2 matching-mode config, orthogonal axes (see feat_nn_batch below):
+#   match_mode: "mean" (default) searches the mean per-vertex target feature;
+#     "min_pairwise" searches every raw per-view observation of each target
+#     vertex (requires the target's all_views feature aggregation to have been
+#     opted into via dataset.extra.feats_aggregation_mode: "all_views", see
+#     src/configs/ablation/feature_model/mc16_vuni4_r256_fdiff3f_allviews.yaml).
+#   dist_type: "euclidean" (default) or "cosine".
+MATCH_MODES = ("mean", "min_pairwise")
+DIST_TYPES  = ("euclidean", "cosine")
+
+
 @register_task("Crsp3DNNTask")
 class Crsp3DNNTask(OD3D_Task):
     """Feature-based nearest-neighbour 3D correspondence.
@@ -400,8 +416,13 @@ class Crsp3DNNTask(OD3D_Task):
       PCK    = fraction where pred target vertex has the correct part label
     """
 
-    def __init__(self, **kwargs):
-        pass
+    def __init__(self, match_mode: str = "mean", dist_type: str = "euclidean", **kwargs):
+        if match_mode not in MATCH_MODES:
+            raise ValueError(f"match_mode must be one of {MATCH_MODES}, got {match_mode!r}")
+        if dist_type not in DIST_TYPES:
+            raise ValueError(f"dist_type must be one of {DIST_TYPES}, got {dist_type!r}")
+        self.match_mode = match_mode
+        self.dist_type  = dist_type
 
     def forward(self, batch: ObjectPairBatch, return_qualit: bool = True) -> Tuple[ObjectPairQuantBatch, ObjectPairQualitBatch]:
         src_verts       = batch.src_verts3d             # (B, V_src, 3)
@@ -416,6 +437,15 @@ class Crsp3DNNTask(OD3D_Task):
         trgt_kpts_mask  = batch.trgt_obj_kpts3d_mask
         src_part_id     = batch.src_verts3d_part_id     # (B, V_src)  int64 or None
         trgt_part_id    = batch.trgt_verts3d_part_id    # (B, V_trgt) int64 or None
+
+        # Stage 2 (match_mode="min_pairwise"): raw per-view target observations,
+        # None unless the dataset opted into all_views feature aggregation. Scope
+        # boundary: only the TARGET side (what feat_nn_batch searches against) uses
+        # all_views — the QUERY side stays a single mean feature vector per query
+        # point (src_feats[...] below, extracted upstream of feat_nn_batch), so
+        # batch.src_verts3d_feats_all_views is intentionally not read here.
+        trgt_feats_all_views      = batch.trgt_verts3d_feats_all_views       # (B, V_trgt, K, F) or None
+        trgt_feats_all_views_mask = batch.trgt_verts3d_feats_all_views_mask  # (B, V_trgt, K) bool or None
 
         has_kpts  = all(x is not None for x in (src_kpts, trgt_kpts, src_verts, src_feats, trgt_verts, trgt_feats))
         has_parts = (src_part_id is not None and trgt_part_id is not None
@@ -442,11 +472,66 @@ class Crsp3DNNTask(OD3D_Task):
 
         # ── shared: query feats → nearest target vert ─────────────────────────
         def feat_nn_batch(query_feats_b, b):
-            """(Q, F) → (Q,) target vert indices via feature nearest-neighbour."""
-            dists = torch.cdist(query_feats_b.float(), trgt_feats[b].float())  # (Q, V_trgt)
+            """(Q, F) → (Q,) target vert indices via feature nearest-neighbour.
+
+            match_mode="mean" (default) searches the mean per-vertex target feature;
+            "min_pairwise" searches every raw per-view observation of each target
+            vertex and takes the min distance over observations per vertex before
+            picking the nearest vertex. dist_type="euclidean" (default) or "cosine"
+            — cosine is implemented by L2-normalizing query/target features before
+            reusing the same cdist+mask+argmin/min pipeline: for unit vectors,
+            ||a-b||^2 = 2 * cosine_distance(a,b), a strictly increasing transform,
+            so argmin/min give identical results computed in either space.
+            """
+            if self.match_mode == "mean" and self.dist_type == "euclidean":
+                # exact legacy path — byte-for-byte identical to pre-Stage-2 code
+                dists = torch.cdist(query_feats_b.float(), trgt_feats[b].float())  # (Q, V_trgt)
+                if trgt_verts_mask is not None:
+                    dists = dists.masked_fill(~trgt_verts_mask[b].unsqueeze(0), float("inf"))
+                return dists.argmin(dim=1)  # (Q,)
+
+            q = query_feats_b.float()  # (Q, F)
+            if self.dist_type == "cosine":
+                q = F.normalize(q, p=2, dim=-1, eps=1e-12)
+
+            if self.match_mode == "mean":
+                t = trgt_feats[b].float()  # (V_trgt, F)
+                if self.dist_type == "cosine":
+                    t = F.normalize(t, p=2, dim=-1, eps=1e-12)
+                dists = torch.cdist(q, t)  # (Q, V_trgt)
+                if trgt_verts_mask is not None:
+                    dists = dists.masked_fill(~trgt_verts_mask[b].unsqueeze(0), float("inf"))
+                return dists.argmin(dim=1)  # (Q,)
+
+            # ── match_mode == "min_pairwise" ───────────────────────────────────
+            if trgt_feats_all_views is None:
+                raise RuntimeError(
+                    "Crsp3DNNTask(match_mode='min_pairwise') requires "
+                    "batch.trgt_verts3d_feats_all_views, but it is None. Fix: add "
+                    "'verts3d_feats_all_views' to dataset.object_modalities and set "
+                    "dataset.extra.feats_aggregation_mode: 'all_views' in the dataset "
+                    "config (see src/configs/ablation/feature_model/"
+                    "mc16_vuni4_r256_fdiff3f_allviews.yaml for a working example)."
+                )
+
+            t_all  = trgt_feats_all_views[b].float()       # (V_trgt, K, F)
+            t_mask = trgt_feats_all_views_mask[b]           # (V_trgt, K) bool
+            if self.dist_type == "cosine":
+                t_all = F.normalize(t_all, p=2, dim=-1, eps=1e-12)
+
+            V_trgt, K, Fdim = t_all.shape
+            Q = q.shape[0]
+            # single vectorized cdist over all (vertex, observation) slots — no
+            # per-vertex / per-observation Python loop
+            dists = torch.cdist(q, t_all.reshape(V_trgt * K, Fdim))         # (Q, V_trgt*K)
+            dists = dists.view(Q, V_trgt, K)                                # (Q, V_trgt, K)
+            dists = dists.masked_fill(~t_mask.unsqueeze(0), float("inf"))   # (Q, V_trgt, K)
+            dists_per_vert = dists.min(dim=2).values                        # (Q, V_trgt)
             if trgt_verts_mask is not None:
-                dists = dists.masked_fill(~trgt_verts_mask[b].unsqueeze(0), float("inf"))
-            return dists.argmin(dim=1)  # (Q,)
+                dists_per_vert = dists_per_vert.masked_fill(
+                    ~trgt_verts_mask[b].unsqueeze(0), float("inf")
+                )
+            return dists_per_vert.argmin(dim=1)  # (Q,)
 
         # ═════════════════════════════════════════════════════════════════════
         # KEYPOINTS

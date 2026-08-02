@@ -19,6 +19,7 @@ class DINOv3Model(OD3D_Model):
         resolution=512,
         tolerance=0.004,
         freeze=True,
+        aggregation_mode="mean",
     ):
         super().__init__()
         self.hub_model = hub_model
@@ -27,6 +28,7 @@ class DINOv3Model(OD3D_Model):
         self.resolution = resolution
         self.tolerance = tolerance
         self.freeze = freeze
+        self.aggregation_mode = aggregation_mode
         self.out_dim = None
 
     def _forward_object_batch(self, batch):
@@ -69,19 +71,38 @@ class DINOv3Model(OD3D_Model):
             1,
             False,
             extractor_fn=extractor,
+            aggregation_mode=self.aggregation_mode,
         )
 
         del extractor
         torch.cuda.empty_cache()
         gc.collect()
 
-        feats = feats.float()
-        vertex_count = feats.shape[0]
         batch_size = (
             batch.verts3d.shape[0]
             if batch.verts3d is not None
             else 1
         )
+
+        if self.aggregation_mode == "all_views":
+            # Mirrors Diff3FModel._forward_object_batch's all_views branch.
+            mean_feats      = feats.mean.float()
+            all_views_feats = feats.all_views
+            all_views_mask  = feats.all_views_mask
+            vertex_count, k = all_views_feats.shape[0], all_views_feats.shape[1]
+            batch.verts3d_feats = (
+                mean_feats.unsqueeze(0).expand(batch_size, vertex_count, -1).contiguous()
+            )
+            batch.verts3d_feats_all_views = (
+                all_views_feats.unsqueeze(0).expand(batch_size, vertex_count, k, -1).contiguous()
+            )
+            batch.verts3d_feats_all_views_mask = (
+                all_views_mask.unsqueeze(0).expand(batch_size, vertex_count, k).contiguous()
+            )
+            return batch
+
+        feats = feats.float()
+        vertex_count = feats.shape[0]
 
         batch.verts3d_feats = (
             feats.unsqueeze(0)

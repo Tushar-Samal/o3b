@@ -237,7 +237,7 @@ def _extract_vert_feats(
     print(feature_model_name)
 
     # ── Models that do their own rendering (diff3f, densematcher/dm) ────────────
-    _SELF_RENDERING = {"diff3f", "dm", "dmmv", "dmweld", "dmweldflip", "siglip2", "dinov3b"}
+    _SELF_RENDERING = {"diff3f", "dm", "dmmv", "dmweld", "dmweldflip", "siglip2", "dinov3b", "tipsv2"}
     if feature_model_name.lower() in _SELF_RENDERING:
         from o3b.data.datatypes.object import ObjectBatch
         # num_views/resolution as parsed from the mesh_type string (e.g. "vuni4_r256")
@@ -258,14 +258,6 @@ def _extract_vert_feats(
                 obj_batch.verts3d_feats_all_views_mask[0].cpu(),
             )
         return obj_batch.verts3d_feats[0].cpu(), None, None  # (V, F)
-
-    if aggregation_mode == "all_views":
-        raise NotImplementedError(
-            f"aggregation_mode='all_views' is only implemented for self-rendering "
-            f"feature models ({sorted(_SELF_RENDERING)}); {feature_model_name!r} uses "
-            f"the generic grid-sample + masked-mean pipeline below, which doesn't "
-            f"support it yet."
-        )
 
     H = W = resolution
 
@@ -330,7 +322,18 @@ def _extract_vert_feats(
     # masked mean across views
     valid_f = valid.float().unsqueeze(1)                          # (N, 1, V)
     vert_feats = (sampled * valid_f).sum(0) / valid_f.sum(0).clamp(min=1)  # (C, V)
-    return vert_feats.T.cpu(), None, None                         # (V, C)
+
+    if aggregation_mode != "all_views":
+        return vert_feats.T.cpu(), None, None                     # (V, C)
+
+    # all_views: unlike the self-rendering ball_query path (diff3f.py), every vertex
+    # here already has exactly one fixed slot per rendered view (this pipeline is a
+    # dense (N, V) sample grid, not raw per-pixel hits) — so no ragged grouping /
+    # padding is needed, just a reshape. Zero out invalid (out-of-frame) slots to
+    # match the zero-padding convention the self-rendering all_views path uses.
+    all_views      = (sampled * valid.unsqueeze(1).float()).permute(2, 0, 1).contiguous()  # (V, N, C)
+    all_views_mask = valid.permute(1, 0).contiguous()                                       # (V, N)
+    return vert_feats.T.cpu(), all_views.cpu(), all_views_mask.cpu()  # (V,C), (V,N,C), (V,N)
 
 
 def convert_mesh_to_mc(mesh: Mesh, res: int = 64) -> Mesh:

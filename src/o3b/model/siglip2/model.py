@@ -25,6 +25,7 @@ class SigLIP2Model(OD3D_Model):
         resolution: int = 512,
         tolerance: float = 0.004,
         freeze: bool = True,
+        aggregation_mode: str = "mean",
     ):
         super().__init__()
         self.hub_model = hub_model
@@ -32,6 +33,7 @@ class SigLIP2Model(OD3D_Model):
         self.resolution = resolution
         self.tolerance = tolerance
         self.freeze = freeze
+        self.aggregation_mode = aggregation_mode
         self.out_dim = None  # known only once the extractor loads the HF config
 
     def _forward_object_batch(self, batch):
@@ -54,15 +56,30 @@ class SigLIP2Model(OD3D_Model):
             None, self.num_views, self.resolution, self.resolution,
             self.tolerance, 1, False,
             extractor_fn=extractor,
-        )  # (V, C) float cpu
+            aggregation_mode=self.aggregation_mode,
+        )  # (V, C) float cpu, or PerVertexFeatures if aggregation_mode="all_views"
 
         del extractor
         torch.cuda.empty_cache()
         gc.collect()
 
+        B = batch.verts3d.shape[0] if batch.verts3d is not None else 1
+
+        if self.aggregation_mode == "all_views":
+            # Mirrors Diff3FModel._forward_object_batch's all_views branch: the mean
+            # representation still lands on verts3d_feats unchanged, all_views is a
+            # parallel, opt-in field.
+            mean_feats      = feats.mean.float()
+            all_views_feats = feats.all_views
+            all_views_mask  = feats.all_views_mask
+            V, K = all_views_feats.shape[0], all_views_feats.shape[1]
+            batch.verts3d_feats = mean_feats.unsqueeze(0).expand(B, V, -1).contiguous()
+            batch.verts3d_feats_all_views = all_views_feats.unsqueeze(0).expand(B, V, K, -1).contiguous()
+            batch.verts3d_feats_all_views_mask = all_views_mask.unsqueeze(0).expand(B, V, K).contiguous()
+            return batch
+
         feats = feats.float()
         V = feats.shape[0]
-        B = batch.verts3d.shape[0] if batch.verts3d is not None else 1
         batch.verts3d_feats = feats.unsqueeze(0).expand(B, V, -1).contiguous()
         return batch
 
