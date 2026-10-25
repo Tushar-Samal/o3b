@@ -31,6 +31,7 @@ class TIPSv2Model(OD3D_Model):
         feature_resolution: int = 448,
         tolerance: float = 0.004,
         freeze: bool = True,
+        aggregation_mode: str = "mean",
     ):
         super().__init__()
         self.hub_model = hub_model
@@ -39,6 +40,7 @@ class TIPSv2Model(OD3D_Model):
         self.feature_resolution = feature_resolution
         self.tolerance = tolerance
         self.freeze = freeze
+        self.aggregation_mode = aggregation_mode
         # depends on hub_model variant (768/1024/1152/1536); set on first forward
         self.out_dim = None
 
@@ -72,15 +74,30 @@ class TIPSv2Model(OD3D_Model):
             num_images_per_prompt=1,
             use_normal_map=False,
             extractor_fn=extractor,
-        )  # (V, C) float cpu
+            aggregation_mode=self.aggregation_mode,
+        )  # (V, C) float cpu, or PerVertexFeatures if aggregation_mode="all_views"
 
         del extractor
         torch.cuda.empty_cache()
         gc.collect()
 
+        B = batch.verts3d.shape[0] if batch.verts3d is not None else 1
+
+        if self.aggregation_mode == "all_views":
+            # Mirrors SigLIP2Model/DINOv3Model's all_views branch: the mean
+            # representation still lands on verts3d_feats unchanged, all_views is a
+            # parallel, opt-in field.
+            mean_feats      = feats.mean.float()
+            all_views_feats = feats.all_views
+            all_views_mask  = feats.all_views_mask
+            V, K = all_views_feats.shape[0], all_views_feats.shape[1]
+            batch.verts3d_feats = mean_feats.unsqueeze(0).expand(B, V, -1).contiguous()
+            batch.verts3d_feats_all_views = all_views_feats.unsqueeze(0).expand(B, V, K, -1).contiguous()
+            batch.verts3d_feats_all_views_mask = all_views_mask.unsqueeze(0).expand(B, V, K).contiguous()
+            return batch
+
         feats = feats.float()
         V = feats.shape[0]
-        B = batch.verts3d.shape[0] if batch.verts3d is not None else 1
         batch.verts3d_feats = feats.unsqueeze(0).expand(B, V, -1).contiguous()
         return batch
 
